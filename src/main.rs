@@ -1,28 +1,17 @@
 use futures_util::stream::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time;
 use log::{debug, error, info, warn};
-use env_logger::Env;
 
 
 #[derive(Debug, Deserialize)]
 struct Antenna {
-    id: String,
-    name: String,
     #[serde(rename = "keywords")]
     keywords_groups: Vec<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamEvent {
-    event: String,
-    #[serde(rename = "payload")]
-    payload_str: String,
 }
 
 #[derive(Debug)]
@@ -38,23 +27,13 @@ struct Post {
     #[serde(default)]
     content: String,
     uri: String,  // We need this for importing
-    #[serde(default)]
-    visibility: String,
     account: Account,
 }
 
 #[derive(Debug, Deserialize)]
 struct Account {
     #[serde(default)]
-    id: String,
-    #[serde(default)]
-    username: String,
-    #[serde(default)]
-    acct: String,
-    #[serde(default)]
-    display_name: String,
-    #[serde(default)]
-    url: String,
+    username: String
 }
 
 #[derive(Debug, Serialize)]
@@ -98,7 +77,7 @@ async fn connect_to_stream(
                     // Process the streaming response
                     let mut stream = response.bytes_stream();
                     let mut buffer = String::new();
-                    let mut last_activity = std::time::Instant::now();
+                    let mut last_activity : Instant;
                     let mut incomplete_utf8 = Vec::new(); // Buffer for incomplete UTF-8 sequences
                     
                     while let Some(chunk_result) = stream.next().await {
@@ -357,20 +336,6 @@ async fn process_message(
     }
     
     Ok(())
-}
-
-fn extract_words(text: &str) -> HashSet<String> {
-    let mut words = HashSet::new();
-    
-    // Split text by non-alphanumeric characters and collect words
-    for word in text.split(|c: char| !c.is_alphanumeric()) {
-        let word = word.trim();
-        if !word.is_empty() {
-            words.insert(word.to_string());
-        }
-    }
-    
-    words
 }
 
 fn matches_word_boundary(content: &str, keyword: &str) -> bool {
