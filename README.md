@@ -22,5 +22,6 @@ The application requires the following environment variables:
 | STREAMING_URL | The full URL for the streaming API (e.g., https://fedi.buzz/api/v1/streaming/public) |
 | API_TOKEN | Your API token with the required scopes |
 | MAX_MATCHES_PER_MINUTE | The maximum number of matches to process per antenna per minute (default: 15) |
+| METRICS_PORT | The port for the Prometheus server (default: 9091) |
 
 A sample systemd Unit file is provided at [[super-antenna.service]](super-antenna.service). Make sure to adjust the paths and environment variables as needed.
