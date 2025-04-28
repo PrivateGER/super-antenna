@@ -1,17 +1,28 @@
 use futures_util::stream::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time;
 use log::{debug, error, info, warn};
+use env_logger::Env;
 
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Antenna {
+    id: String,
+    name: String,
     #[serde(rename = "keywords")]
     keywords_groups: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamEvent {
+    event: String,
+    #[serde(rename = "payload")]
+    payload_str: String,
 }
 
 #[derive(Debug)]
@@ -27,13 +38,23 @@ struct Post {
     #[serde(default)]
     content: String,
     uri: String,  // We need this for importing
+    #[serde(default)]
+    visibility: String,
     account: Account,
 }
 
 #[derive(Debug, Deserialize)]
 struct Account {
     #[serde(default)]
-    username: String
+    id: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    acct: String,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -41,12 +62,43 @@ struct ImportRequest {
     uri: String,
 }
 
+// Add this struct to track rate limiting information
+#[derive(Debug)]
+struct RateLimitInfo {
+    matches: Vec<Instant>,
+    max_per_minute: usize,
+}
+
+impl RateLimitInfo {
+    fn new(max_per_minute: usize) -> Self {
+        Self {
+            matches: Vec::new(),
+            max_per_minute,
+        }
+    }
+
+    fn can_process(&mut self) -> bool {
+        // Remove timestamps older than 1 minute
+        let one_minute_ago = Instant::now() - Duration::from_secs(60);
+        self.matches.retain(|&timestamp| timestamp > one_minute_ago);
+        
+        // Check if we're under the limit
+        if self.matches.len() < self.max_per_minute {
+            self.matches.push(Instant::now());
+            true
+        } else {
+            false
+        }
+    }
+}
+
 // Add this function to handle the streaming connection with reconnection
 async fn connect_to_stream(
     client: &Client, 
     streaming_url: &str,
     base_url: &str,
-    keyword_groups: &Arc<Mutex<Vec<Vec<String>>>>,
+    antennas: &Arc<Mutex<Vec<Antenna>>>,
+    rate_limits: &Arc<Mutex<HashMap<String, RateLimitInfo>>>,
     api_token: &str
 ) -> Result<(), Box<dyn Error>> {
     let mut retry_count = 0;
@@ -77,7 +129,7 @@ async fn connect_to_stream(
                     // Process the streaming response
                     let mut stream = response.bytes_stream();
                     let mut buffer = String::new();
-                    let mut last_activity : Instant;
+                    let mut last_activity = std::time::Instant::now();
                     let mut incomplete_utf8 = Vec::new(); // Buffer for incomplete UTF-8 sequences
                     
                     while let Some(chunk_result) = stream.next().await {
@@ -132,7 +184,7 @@ async fn connect_to_stream(
                                     
                                     for event in parts {
                                         if !event.is_empty() {
-                                            if let Err(e) = process_message(&event, client, base_url, keyword_groups, api_token).await {
+                                            if let Err(e) = process_message(&event, client, base_url, antennas, rate_limits, api_token).await {
                                                 error!("Error processing message: {}", e);
                                             }
                                         }
@@ -196,47 +248,75 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .build()?;
     
     // Create shared keywords structure
-    let keyword_groups = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let antennas = Arc::new(Mutex::new(Vec::<Antenna>::new()));
     
-    // Clone references for the keyword fetcher task
-    let keyword_groups_for_fetcher = Arc::clone(&keyword_groups);
+    // Create rate limit tracker
+    let rate_limits = Arc::new(Mutex::new(HashMap::<String, RateLimitInfo>::new()));
+    
+    // Get max matches per minute from environment or use default
+    let max_matches_per_minute = match std::env::var("MAX_MATCHES_PER_MINUTE") {
+        Ok(val) => val.parse::<usize>().unwrap_or(15),
+        Err(_) => 15, // Default to 5 matches per minute per antenna
+    };
+    
+    info!("Rate limiting set to {} matches per minute per antenna", max_matches_per_minute);
+    
+    // Clone references for the antenna fetcher task
+    let antennas_for_fetcher = Arc::clone(&antennas);
+    let rate_limits_for_fetcher = Arc::clone(&rate_limits);
     let client_for_fetcher = client.clone();
     let base_url_for_fetcher = base_url.clone();
     
-    // Spawn keyword fetcher task
+    // Spawn antenna fetcher task
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(60));
         
         loop {
             interval.tick().await;
-            match fetch_keywords(&client_for_fetcher, &base_url_for_fetcher).await {
-                Ok(new_keyword_groups) => {
-                    let mut keyword_groups_guard = keyword_groups_for_fetcher.lock().unwrap();
-                    *keyword_groups_guard = new_keyword_groups;
-                    info!("Updated keyword groups: {:?}", *keyword_groups_guard);
+            match fetch_antennas(&client_for_fetcher, &base_url_for_fetcher).await {
+                Ok(new_antennas) => {
+                    let mut antennas_guard = antennas_for_fetcher.lock().unwrap();
+                    *antennas_guard = new_antennas;
+                    
+                    // Update rate limit trackers for new antennas
+                    let mut rate_limits_guard = rate_limits_for_fetcher.lock().unwrap();
+                    for antenna in antennas_guard.iter() {
+                        if !rate_limits_guard.contains_key(&antenna.id) {
+                            rate_limits_guard.insert(antenna.id.clone(), RateLimitInfo::new(max_matches_per_minute));
+                        }
+                    }
+                    
+                    info!("Updated antennas: {}", antennas_guard.len());
                 }
-                Err(e) => error!("Failed to fetch keywords: {}", e),
+                Err(e) => error!("Failed to fetch antennas: {}", e),
             }
         }
     });
     
-    // Initial keyword fetch
-    match fetch_keywords(&client, &base_url).await {
-        Ok(new_keyword_groups) => {
-            let mut keyword_groups_guard = keyword_groups.lock().unwrap();
-            *keyword_groups_guard = new_keyword_groups;
-            info!("Initial keyword groups: {:?}", *keyword_groups_guard);
+    // Initial antenna fetch
+    match fetch_antennas(&client, &base_url).await {
+        Ok(new_antennas) => {
+            let mut antennas_guard = antennas.lock().unwrap();
+            *antennas_guard = new_antennas;
+            
+            // Initialize rate limit trackers
+            let mut rate_limits_guard = rate_limits.lock().unwrap();
+            for antenna in antennas_guard.iter() {
+                rate_limits_guard.insert(antenna.id.clone(), RateLimitInfo::new(max_matches_per_minute));
+            }
+            
+            info!("Initial antennas loaded: {}", antennas_guard.len());
         }
-        Err(e) => error!("Failed to fetch initial keywords: {}", e),
+        Err(e) => error!("Failed to fetch initial antennas: {}", e),
     }
     
-    connect_to_stream(&client, &streaming_url, &base_url, &keyword_groups, &api_token).await?;
+    connect_to_stream(&client, &streaming_url, &base_url, &antennas, &rate_limits, &api_token).await?;
     
     Ok(())
 }
 
-async fn fetch_keywords(client: &Client, base_url: &str) -> Result<Vec<Vec<String>>, Box<dyn Error>> {
-    info!("Fetching keywords from {}", base_url);
+async fn fetch_antennas(client: &Client, base_url: &str) -> Result<Vec<Antenna>, Box<dyn Error>> {
+    info!("Fetching antennas from {}", base_url);
     
     let url = format!("{}/api/admin/antennas/global", base_url);
     
@@ -247,36 +327,21 @@ async fn fetch_keywords(client: &Client, base_url: &str) -> Result<Vec<Vec<Strin
         .await?;
     
     if response.status() != StatusCode::OK {
-        return Err(format!("Failed to fetch keywords: HTTP {}", response.status()).into());
+        return Err(format!("Failed to fetch antennas: HTTP {}", response.status()).into());
     }
     
     let antennas: Vec<Antenna> = response.json().await?;
+    info!("Fetched {} antennas", antennas.len());
     
-    let mut keyword_groups = Vec::new();
-    for antenna in antennas {
-        for keyword_group in antenna.keywords_groups {
-            // Filter out empty keywords and convert to lowercase
-            let filtered_group: Vec<String> = keyword_group
-                .into_iter()
-                .filter(|k| !k.is_empty())
-                .map(|k| k.to_lowercase())
-                .collect();
-            
-            if !filtered_group.is_empty() {
-                keyword_groups.push(filtered_group);
-            }
-        }
-    }
-    
-    info!("Fetched {} keyword groups", keyword_groups.len());
-    Ok(keyword_groups)
+    Ok(antennas)
 }
 
 async fn process_message(
     message: &str,
     client: &Client,
     base_url: &str,
-    keyword_groups: &Arc<Mutex<Vec<Vec<String>>>>,
+    antennas: &Arc<Mutex<Vec<Antenna>>>,
+    rate_limits: &Arc<Mutex<HashMap<String, RateLimitInfo>>>,
     api_token: &str,
 ) -> Result<(), Box<dyn Error>> {
     // Parse the server-sent event
@@ -306,36 +371,82 @@ async fn process_message(
     };
     
     // Check if the post contains any of our keyword groups
-    let keyword_groups_guard = keyword_groups.lock().unwrap();
+    let antennas_guard = antennas.lock().unwrap();
     let post_content = post.content.to_lowercase();
     
-    // Check if any keyword group matches (OR condition between groups)
-    let matches = keyword_groups_guard.iter().any(|group| {
-        // Check if all keywords in this group match (AND condition within group)
-        group.iter().all(|keyword| matches_word_boundary(&post_content, keyword))
-    });
+    // Find matching antennas
+    let matching_antennas: Vec<String> = antennas_guard.iter()
+        .filter(|antenna| {
+            antenna.keywords_groups.iter().any(|group| {
+                // Check if all keywords in this group match (AND condition within group)
+                group.iter().all(|keyword| matches_word_boundary(&post_content, keyword))
+            })
+        })
+        .map(|antenna| antenna.id.clone())
+        .collect();
     
-    if matches {
-        info!("Found matching post: {} by @{}", post.id, post.account.username);
+    // Drop the antennas guard before processing matches
+    drop(antennas_guard);
+    
+    if !matching_antennas.is_empty() {
+        // Check rate limits for each matching antenna
+        let mut rate_limits_guard = rate_limits.lock().unwrap();
+        let mut processed_antennas = Vec::new();
         
-        // Import the post using the actual URI from the post
-        let import_url = format!("{}/api/ap/show", base_url);
-        let import_request = ImportRequest { uri: post.uri };
+        for antenna_id in matching_antennas {
+            let rate_limit = rate_limits_guard.entry(antenna_id.clone())
+                .or_insert_with(|| {
+                    warn!("Creating missing rate limit entry for antenna {}", antenna_id);
+                    RateLimitInfo::new(5) // Default to 5 if missing
+                });
+            
+            if rate_limit.can_process() {
+                processed_antennas.push(antenna_id);
+            } else {
+                warn!("Rate limit exceeded for antenna {}, skipping match", antenna_id);
+            }
+        }
         
-        let response = client.post(&import_url)
-            .header("Authorization", format!("Bearer {}", api_token))
-            .json(&import_request)
-            .send()
-            .await?;
+        // Drop the rate limits guard before making API calls
+        drop(rate_limits_guard);
         
-        if response.status().is_success() {
-            info!("Successfully imported post {}", post.id);
-        } else {
-            error!("Failed to import post {}: HTTP {}", post.id, response.status());
+        if !processed_antennas.is_empty() {
+            info!("Found matching post: {} by @{} for {} antennas", 
+                  post.id, post.account.username, processed_antennas.len());
+            
+            // Import the post using the actual URI from the post
+            let import_url = format!("{}/api/ap/show", base_url);
+            let import_request = ImportRequest { uri: post.uri };
+            
+            let response = client.post(&import_url)
+                .header("Authorization", format!("Bearer {}", api_token))
+                .json(&import_request)
+                .send()
+                .await?;
+            
+            if response.status().is_success() {
+                info!("Successfully imported post {} for antennas: {:?}", post.id, processed_antennas);
+            } else {
+                error!("Failed to import post {}: HTTP {}", post.id, response.status());
+            }
         }
     }
     
     Ok(())
+}
+
+fn extract_words(text: &str) -> HashSet<String> {
+    let mut words = HashSet::new();
+    
+    // Split text by non-alphanumeric characters and collect words
+    for word in text.split(|c: char| !c.is_alphanumeric()) {
+        let word = word.trim();
+        if !word.is_empty() {
+            words.insert(word.to_string());
+        }
+    }
+    
+    words
 }
 
 fn matches_word_boundary(content: &str, keyword: &str) -> bool {
