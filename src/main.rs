@@ -333,9 +333,6 @@ async fn process_message(
     let keyword_groups_guard = keyword_groups.lock().unwrap();
     let post_content = post.content.to_lowercase();
     
-    // Extract words from the post content
-    let post_words = extract_words(&post_content);
-    
     // Check if any keyword group matches (OR condition between groups)
     let matches = keyword_groups_guard.iter().any(|group| {
         // Check if all keywords in this group match (AND condition within group)
@@ -381,9 +378,15 @@ fn extract_words(text: &str) -> HashSet<String> {
 }
 
 fn matches_word_boundary(content: &str, keyword: &str) -> bool {
-    // If keyword contains spaces, it's a phrase - check for the whole phrase
-    if keyword.contains(' ') {
-        return content.contains(keyword);
+    // Split the keyword by spaces to handle individual words
+    let keyword_parts: Vec<&str> = keyword.split_whitespace().collect();
+    
+    // If there are multiple parts, each part must match as a whole word
+    if keyword_parts.len() > 1 {
+        return keyword_parts.iter().all(|part| {
+            content.split(|c: char| !c.is_alphanumeric())
+                .any(|word| word.trim().eq_ignore_ascii_case(part))
+        });
     }
     
     // For single words, check with word boundaries
