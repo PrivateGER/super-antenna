@@ -7,7 +7,8 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time;
-
+use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Registry};
+use warp::Filter;
 
 #[derive(Debug, Deserialize, Clone)]
 struct Antenna {
@@ -88,6 +89,66 @@ impl RateLimitInfo {
     }
 }
 
+// Create a struct to hold our metrics
+#[derive(Clone)]
+struct Metrics {
+    registry: Registry,
+    posts_processed: IntCounter,
+    posts_matched: IntCounterVec,
+    posts_rate_limited: IntCounterVec,
+    active_antennas: IntGauge,
+    post_processing_time: Histogram,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        let registry = Registry::new();
+        
+        let posts_processed = IntCounter::new(
+            "super_antenna_posts_processed_total", 
+            "Total number of posts processed"
+        ).unwrap();
+        
+        let posts_matched = IntCounterVec::new(
+            prometheus::opts!("super_antenna_posts_matched_total", "Total number of posts matched by antenna"),
+            &["antenna_id"]
+        ).unwrap();
+        
+        let posts_rate_limited = IntCounterVec::new(
+            prometheus::opts!("super_antenna_posts_rate_limited_total", "Total number of posts rate limited by antenna"),
+            &["antenna_id"]
+        ).unwrap();
+        
+        let active_antennas = IntGauge::new(
+            "super_antenna_active_antennas", 
+            "Number of active antennas"
+        ).unwrap();
+        
+        let post_processing_time = Histogram::with_opts(
+            HistogramOpts::new(
+                "super_antenna_post_processing_time_seconds",
+                "Time taken to process a post"
+            ).buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0])
+        ).unwrap();
+        
+        // Register all metrics
+        registry.register(Box::new(posts_processed.clone())).unwrap();
+        registry.register(Box::new(posts_matched.clone())).unwrap();
+        registry.register(Box::new(posts_rate_limited.clone())).unwrap();
+        registry.register(Box::new(active_antennas.clone())).unwrap();
+        registry.register(Box::new(post_processing_time.clone())).unwrap();
+        
+        Self {
+            registry,
+            posts_processed,
+            posts_matched,
+            posts_rate_limited,
+            active_antennas,
+            post_processing_time,
+        }
+    }
+}
+
 // Add this function to handle the streaming connection with reconnection
 async fn connect_to_stream(
     client: &Client, 
@@ -95,7 +156,8 @@ async fn connect_to_stream(
     base_url: &str,
     antennas: &Arc<Mutex<Vec<Antenna>>>,
     rate_limits: &Arc<Mutex<HashMap<String, RateLimitInfo>>>,
-    api_token: &str
+    api_token: &str,
+    metrics: &Metrics
 ) -> Result<(), Box<dyn Error>> {
     let mut retry_count = 0;
     let max_retries = 5;
@@ -125,12 +187,12 @@ async fn connect_to_stream(
                     // Process the streaming response
                     let mut stream = response.bytes_stream();
                     let mut buffer = String::new();
-                    let mut last_activity : Instant;
+                    let mut last_activity;
                     let mut incomplete_utf8 = Vec::new(); // Buffer for incomplete UTF-8 sequences
                     
                     while let Some(chunk_result) = stream.next().await {
                         // Update last activity timestamp
-                        last_activity = std::time::Instant::now();
+                        last_activity = Instant::now();
                         
                         match chunk_result {
                             Ok(chunk) => {
@@ -180,7 +242,7 @@ async fn connect_to_stream(
                                     
                                     for event in parts {
                                         if !event.is_empty() {
-                                            if let Err(e) = process_message(&event, client, base_url, antennas, rate_limits, api_token).await {
+                                            if let Err(e) = process_message(&event, client, base_url, antennas, rate_limits, api_token, metrics).await {
                                                 error!("Error processing message: {}", e);
                                             }
                                         }
@@ -235,8 +297,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let streaming_url = std::env::var("STREAMING_URL").expect("STREAMING_URL must be set");
     let api_token = std::env::var("API_TOKEN").expect("API_TOKEN must be set");
     
+    // Get metrics port from environment or use default
+    let metrics_port = match std::env::var("METRICS_PORT") {
+        Ok(val) => val.parse::<u16>().unwrap_or(9091),
+        Err(_) => 9091, // Default to port 9091
+    };
+    
     info!("Using base URL: {}", base_url);
     info!("Using streaming URL: {}", streaming_url);
+    info!("Metrics will be exposed on port {}", metrics_port);
+    
+    // Initialize metrics
+    let metrics = Metrics::new();
     
     // Create HTTP client with no timeout for streaming connections
     let client = Client::builder()
@@ -252,7 +324,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Get max matches per minute from environment or use default
     let max_matches_per_minute = match std::env::var("MAX_MATCHES_PER_MINUTE") {
         Ok(val) => val.parse::<usize>().unwrap_or(15),
-        Err(_) => 15, // Default to 5 matches per minute per antenna
+        Err(_) => 15, // Default to 15 matches per minute per antenna
     };
     
     info!("Rate limiting set to {} matches per minute per antenna", max_matches_per_minute);
@@ -262,6 +334,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let rate_limits_for_fetcher = Arc::clone(&rate_limits);
     let client_for_fetcher = client.clone();
     let base_url_for_fetcher = base_url.clone();
+    let metrics_for_fetcher = metrics.clone();
     
     // Spawn antenna fetcher task
     tokio::spawn(async move {
@@ -273,6 +346,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 Ok(new_antennas) => {
                     let mut antennas_guard = antennas_for_fetcher.lock().unwrap();
                     *antennas_guard = new_antennas;
+                    
+                    // Update metrics for active antennas
+                    metrics_for_fetcher.active_antennas.set(antennas_guard.len() as i64);
                     
                     // Update rate limit trackers for new antennas
                     let mut rate_limits_guard = rate_limits_for_fetcher.lock().unwrap();
@@ -295,6 +371,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut antennas_guard = antennas.lock().unwrap();
             *antennas_guard = new_antennas;
             
+            // Set initial metrics for active antennas
+            metrics.active_antennas.set(antennas_guard.len() as i64);
+            
             // Initialize rate limit trackers
             let mut rate_limits_guard = rate_limits.lock().unwrap();
             for antenna in antennas_guard.iter() {
@@ -306,7 +385,46 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(e) => error!("Failed to fetch initial antennas: {}", e),
     }
     
-    connect_to_stream(&client, &streaming_url, &base_url, &antennas, &rate_limits, &api_token).await?;
+    // Clone metrics for the metrics server
+    let metrics_for_server = metrics.clone();
+    
+    // Start metrics server
+    tokio::spawn(async move {
+        // Create a warp filter that responds with the metrics
+        let metrics_route = warp::path!("metrics")
+            .map(move || {
+                let encoder = prometheus::TextEncoder::new();
+                let metric_families = metrics_for_server.registry.gather();
+                let mut buffer = Vec::new();
+                encoder.encode(&metric_families, &mut buffer).unwrap();
+                String::from_utf8(buffer).unwrap()
+            });
+        
+        // Add a health check endpoint
+        let health_route = warp::path!("health")
+            .map(|| "OK");
+        
+        // Combine routes
+        let routes = metrics_route.or(health_route);
+        
+        info!("Starting metrics server on port {}", metrics_port);
+        warp::serve(routes)
+            .run(([0, 0, 0, 0], metrics_port))
+            .await;
+    });
+    
+    // Clone metrics for the streaming connection
+    let metrics_for_stream = metrics.clone();
+    
+    connect_to_stream(
+        &client, 
+        &streaming_url, 
+        &base_url, 
+        &antennas, 
+        &rate_limits, 
+        &api_token,
+        &metrics_for_stream
+    ).await?;
     
     Ok(())
 }
@@ -339,13 +457,22 @@ async fn process_message(
     antennas: &Arc<Mutex<Vec<Antenna>>>,
     rate_limits: &Arc<Mutex<HashMap<String, RateLimitInfo>>>,
     api_token: &str,
+    metrics: &Metrics,
 ) -> Result<(), Box<dyn Error>> {
+    // Start timing the processing
+    let timer = metrics.post_processing_time.start_timer();
+    
+    // Increment the posts processed counter
+    metrics.posts_processed.inc();
+    
     // Parse the server-sent event
     let sse = match parse_server_sent_event(message) {
         Ok(sse) => sse,
         Err(e) => {
             debug!("Skipping malformed SSE: {}", e);
             debug!("Message content: {}", message);
+            // Stop the timer
+            timer.observe_duration();
             return Ok(());
         }
     };
@@ -353,6 +480,8 @@ async fn process_message(
     // Only process update events
     if sse.event != "update" {
         debug!("Skipping non-update event: {}", sse.event);
+        // Stop the timer
+        timer.observe_duration();
         return Ok(());
     }
 
@@ -362,6 +491,8 @@ async fn process_message(
         Err(e) => {
             debug!("Failed to parse post: {}", e);
             debug!("JSON content: {}", sse.data);
+            // Stop the timer
+            timer.observe_duration();
             return Ok(());
         }
     };
@@ -397,8 +528,13 @@ async fn process_message(
                 });
             
             if rate_limit.can_process() {
-                processed_antennas.push(antenna_id);
+                processed_antennas.push(antenna_id.clone());
+                // Increment the matched posts counter for this antenna
+                metrics.posts_matched.with_label_values(&[&antenna_id]).inc();
             } else {
+                // Increment the rate limited posts counter for this antenna
+                metrics.posts_rate_limited.with_label_values(&[&antenna_id]).inc();
+                
                 // Only log if this is the first time we're hitting the limit
                 if rate_limit.should_log_rate_limit() {
                     warn!("Rate limit exceeded for antenna {}, skipping matches until rate limit resets", antenna_id);
@@ -408,7 +544,7 @@ async fn process_message(
         
         // Drop the rate limits guard before making API calls
         drop(rate_limits_guard);
-        
+
         if !processed_antennas.is_empty() {
             info!("Found matching post: {} by @{} for {} antennas", 
                   post.id, post.account.username, processed_antennas.len());
@@ -430,7 +566,7 @@ async fn process_message(
             }
         }
     }
-    
+
     Ok(())
 }
 
