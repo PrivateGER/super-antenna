@@ -16,7 +16,6 @@ struct Antenna {
     name: String,
     #[serde(rename = "keywords")]
     keywords_groups: Vec<Vec<String>>,
-    // Other fields can be added as needed
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,7 +197,6 @@ async fn connect_to_stream(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize logger
     env_logger::Builder::from_default_env()
         .format_timestamp_secs()
         .init();
@@ -253,7 +251,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Err(e) => error!("Failed to fetch initial keywords: {}", e),
     }
     
-    // Connect to streaming API with reconnection logic
     connect_to_stream(&client, &streaming_url, &base_url, &keyword_groups, &api_token).await?;
     
     Ok(())
@@ -362,7 +359,6 @@ async fn process_message(
     Ok(())
 }
 
-// Add a helper function to extract words from text
 fn extract_words(text: &str) -> HashSet<String> {
     let mut words = HashSet::new();
     
