@@ -33,12 +33,12 @@ jobs:
     - uses: actions/checkout@v3
 
     - name: Install Rust toolchain
-      uses: actions-rs/toolchain@v1
+      uses: dtolnay/rust-toolchain@stable
       with:
-        profile: minimal
-        toolchain: stable
-        target: ${{ matrix.target }}
-        override: true
+        targets: ${{ matrix.target }}
+
+    - name: Rust cache
+      uses: Swatinem/rust-cache@v2
 
     - name: Build
       uses: actions-rs/cargo@v1
@@ -58,6 +58,7 @@ jobs:
         name: ${{ matrix.asset_name }}
         path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
         if-no-files-found: error
+        retention-days: 5
 
   # Optional job to create a release when a tag is pushed
   release:
@@ -65,26 +66,28 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
-
       - name: Download all artifacts
         uses: actions/download-artifact@v3
         with:
           path: artifacts
 
-      - name: Upload Release Assets
+      - name: Display structure of downloaded files
+        run: ls -R artifacts/
+        shell: bash
+
+      - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/**/*
+          files: |
+            artifacts/super-antenna-linux-amd64/super-antenna
+            artifacts/super-antenna-windows-amd64.exe/super-antenna.exe
+            artifacts/super-antenna-macos-amd64/super-antenna
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
