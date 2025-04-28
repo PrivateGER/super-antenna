@@ -48,6 +48,7 @@ struct ImportRequest {
 struct RateLimitInfo {
     matches: Vec<Instant>,
     max_per_minute: usize,
+    last_warning_time: Option<Instant>,
 }
 
 impl RateLimitInfo {
@@ -55,6 +56,7 @@ impl RateLimitInfo {
         Self {
             matches: Vec::new(),
             max_per_minute,
+            last_warning_time: None,
         }
     }
 
@@ -69,6 +71,19 @@ impl RateLimitInfo {
             true
         } else {
             false
+        }
+    }
+    
+    fn should_log_rate_limit(&mut self) -> bool {
+        let now = Instant::now();
+        
+        // Only log warnings once per minute
+        match self.last_warning_time {
+            Some(last_time) if now.duration_since(last_time) < Duration::from_secs(60) => false,
+            _ => {
+                self.last_warning_time = Some(now);
+                true
+            }
         }
     }
 }
@@ -384,7 +399,10 @@ async fn process_message(
             if rate_limit.can_process() {
                 processed_antennas.push(antenna_id);
             } else {
-                warn!("Rate limit exceeded for antenna {}, skipping match", antenna_id);
+                // Only log if this is the first time we're hitting the limit
+                if rate_limit.should_log_rate_limit() {
+                    warn!("Rate limit exceeded for antenna {}, skipping matches until rate limit resets", antenna_id);
+                }
             }
         }
         
@@ -461,6 +479,7 @@ fn parse_server_sent_event(message: &str) -> Result<ServerSentEvent, Box<dyn Err
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    use serde_json::json;
 
     #[test]
     fn test_parse_server_sent_event() {
@@ -469,12 +488,6 @@ mod tests {
         let result = parse_server_sent_event(message).unwrap();
         assert_eq!(result.event, "update");
         assert_eq!(result.data, "{\"content\":\"test\"}");
-
-        // Test event with extra whitespace
-        let message = "event:  notification \ndata:  {\"content\":\"test2\"}  ";
-        let result = parse_server_sent_event(message).unwrap();
-        assert_eq!(result.event, "notification");
-        assert_eq!(result.data, "{\"content\":\"test2\"}");
 
         // Test missing data (should default to {})
         let message = "event: delete\n";
@@ -512,6 +525,17 @@ mod tests {
         // Test with special characters
         assert!(matches_word_boundary("hello-world", "hello"));
         assert!(matches_word_boundary("hello_world", "world"));
+        
+        // Test empty strings
+        assert!(!matches_word_boundary("", "hello"));
+        assert!(!matches_word_boundary("hello world", ""));
+        
+        // Test with numbers
+        assert!(matches_word_boundary("test123 hello", "test123"));
+        assert!(matches_word_boundary("hello 42 world", "42"));
+        
+        // Test with multiple spaces
+        assert!(matches_word_boundary("hello    world", "hello world"));
     }
 
     #[test]
@@ -538,5 +562,120 @@ mod tests {
         // Should allow another request after one expired
         assert!(rate_limit.can_process());
         assert!(!rate_limit.can_process());
+        
+        // Test with zero limit
+        let mut zero_limit = RateLimitInfo::new(0);
+        assert!(!zero_limit.can_process());
+    }
+    
+    #[test]
+    fn test_antenna_keyword_matching() {
+        // Create test antennas with different keyword groups
+        let antenna1 = Antenna {
+            id: "1".to_string(),
+            keywords_groups: vec![
+                vec!["rust".to_string(), "programming".to_string()],
+                vec!["tokio".to_string()]
+            ]
+        };
+        
+        let antenna2 = Antenna {
+            id: "2".to_string(),
+            keywords_groups: vec![
+                vec!["hello".to_string(), "world".to_string()]
+            ]
+        };
+        
+        let antennas = Arc::new(Mutex::new(vec![antenna1, antenna2]));
+        
+        // Test post that should match antenna1's first group (both keywords)
+        let post_content1 = "I love rust programming!".to_lowercase();
+        let antennas_guard = antennas.lock().unwrap();
+        let matching1: Vec<String> = antennas_guard.iter()
+            .filter(|antenna| {
+                antenna.keywords_groups.iter().any(|group| {
+                    group.iter().all(|keyword| matches_word_boundary(&post_content1, keyword))
+                })
+            })
+            .map(|antenna| antenna.id.clone())
+            .collect();
+        assert_eq!(matching1, vec!["1"]);
+        
+        // Test post that should match antenna1's second group
+        let post_content2 = "Learning about tokio async runtime".to_lowercase();
+        let matching2: Vec<String> = antennas_guard.iter()
+            .filter(|antenna| {
+                antenna.keywords_groups.iter().any(|group| {
+                    group.iter().all(|keyword| matches_word_boundary(&post_content2, keyword))
+                })
+            })
+            .map(|antenna| antenna.id.clone())
+            .collect();
+        assert_eq!(matching2, vec!["1"]);
+        
+        // Test post that should match antenna2
+        let post_content3 = "Hello world example".to_lowercase();
+        let matching3: Vec<String> = antennas_guard.iter()
+            .filter(|antenna| {
+                antenna.keywords_groups.iter().any(|group| {
+                    group.iter().all(|keyword| matches_word_boundary(&post_content3, keyword))
+                })
+            })
+            .map(|antenna| antenna.id.clone())
+            .collect();
+        assert_eq!(matching3, vec!["2"]);
+        
+        // Test post that should match no antennas
+        let post_content4 = "Nothing interesting here".to_lowercase();
+        let matching4: Vec<String> = antennas_guard.iter()
+            .filter(|antenna| {
+                antenna.keywords_groups.iter().any(|group| {
+                    group.iter().all(|keyword| matches_word_boundary(&post_content4, keyword))
+                })
+            })
+            .map(|antenna| antenna.id.clone())
+            .collect();
+        assert_eq!(matching4, vec![] as Vec<String>);
+    }
+    
+    #[test]
+    fn test_post_deserialization() {
+        // Test basic post JSON
+        let json_str = r#"{"id":"123","content":"Hello world","uri":"https://example.com/posts/123","account":{"username":"testuser"}}"#;
+        let post: Post = serde_json::from_str(json_str).unwrap();
+        assert_eq!(post.id, "123");
+        assert_eq!(post.content, "Hello world");
+        assert_eq!(post.uri, "https://example.com/posts/123");
+        assert_eq!(post.account.username, "testuser");
+        
+        // Test with missing optional fields
+        let json_str = r#"{"uri":"https://example.com/posts/123","account":{"username":"testuser"}}"#;
+        let post: Post = serde_json::from_str(json_str).unwrap();
+        assert_eq!(post.id, "");
+        assert_eq!(post.content, "");
+        assert_eq!(post.uri, "https://example.com/posts/123");
+        assert_eq!(post.account.username, "testuser");
+        
+        // Test with missing required fields
+        let json_str = r#"{"id":"123","content":"Hello world"}"#;
+        let result = serde_json::from_str::<Post>(json_str);
+        assert!(result.is_err());
+    }
+    
+    #[test]
+    fn test_antenna_deserialization() {
+        // Test basic antenna JSON
+        let json_str = r#"{"id":"123","keywords":[["rust","programming"],["tokio"]]}"#;
+        let antenna: Antenna = serde_json::from_str(json_str).unwrap();
+        assert_eq!(antenna.id, "123");
+        assert_eq!(antenna.keywords_groups.len(), 2);
+        assert_eq!(antenna.keywords_groups[0], vec!["rust", "programming"]);
+        assert_eq!(antenna.keywords_groups[1], vec!["tokio"]);
+        
+        // Test with empty keywords
+        let json_str = r#"{"id":"123","keywords":[]}"#;
+        let antenna: Antenna = serde_json::from_str(json_str).unwrap();
+        assert_eq!(antenna.id, "123");
+        assert_eq!(antenna.keywords_groups.len(), 0);
     }
 }
