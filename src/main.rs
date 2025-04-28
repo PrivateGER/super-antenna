@@ -1,28 +1,19 @@
 use futures_util::stream::StreamExt;
+use log::{debug, error, info, warn};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time;
-use log::{debug, error, info, warn};
-use env_logger::Env;
 
 
 #[derive(Debug, Deserialize, Clone)]
 struct Antenna {
     id: String,
-    name: String,
     #[serde(rename = "keywords")]
     keywords_groups: Vec<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamEvent {
-    event: String,
-    #[serde(rename = "payload")]
-    payload_str: String,
 }
 
 #[derive(Debug)]
@@ -38,23 +29,13 @@ struct Post {
     #[serde(default)]
     content: String,
     uri: String,  // We need this for importing
-    #[serde(default)]
-    visibility: String,
     account: Account,
 }
 
 #[derive(Debug, Deserialize)]
 struct Account {
     #[serde(default)]
-    id: String,
-    #[serde(default)]
     username: String,
-    #[serde(default)]
-    acct: String,
-    #[serde(default)]
-    display_name: String,
-    #[serde(default)]
-    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -129,7 +110,7 @@ async fn connect_to_stream(
                     // Process the streaming response
                     let mut stream = response.bytes_stream();
                     let mut buffer = String::new();
-                    let mut last_activity = std::time::Instant::now();
+                    let mut last_activity : Instant;
                     let mut incomplete_utf8 = Vec::new(); // Buffer for incomplete UTF-8 sequences
                     
                     while let Some(chunk_result) = stream.next().await {
@@ -435,20 +416,6 @@ async fn process_message(
     Ok(())
 }
 
-fn extract_words(text: &str) -> HashSet<String> {
-    let mut words = HashSet::new();
-    
-    // Split text by non-alphanumeric characters and collect words
-    for word in text.split(|c: char| !c.is_alphanumeric()) {
-        let word = word.trim();
-        if !word.is_empty() {
-            words.insert(word.to_string());
-        }
-    }
-    
-    words
-}
-
 fn matches_word_boundary(content: &str, keyword: &str) -> bool {
     // Split the keyword by spaces to handle individual words
     let keyword_parts: Vec<&str> = keyword.split_whitespace().collect();
@@ -488,4 +455,88 @@ fn parse_server_sent_event(message: &str) -> Result<ServerSentEvent, Box<dyn Err
     }
     
     Ok(ServerSentEvent { event, data })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_parse_server_sent_event() {
+        // Test valid event
+        let message = "event: update\ndata: {\"content\":\"test\"}";
+        let result = parse_server_sent_event(message).unwrap();
+        assert_eq!(result.event, "update");
+        assert_eq!(result.data, "{\"content\":\"test\"}");
+
+        // Test event with extra whitespace
+        let message = "event:  notification \ndata:  {\"content\":\"test2\"}  ";
+        let result = parse_server_sent_event(message).unwrap();
+        assert_eq!(result.event, "notification");
+        assert_eq!(result.data, "{\"content\":\"test2\"}");
+
+        // Test missing data (should default to {})
+        let message = "event: delete\n";
+        let result = parse_server_sent_event(message).unwrap();
+        assert_eq!(result.event, "delete");
+        assert_eq!(result.data, "{}");
+
+        // Test missing event (should error)
+        let message = "data: {\"content\":\"test\"}";
+        assert!(parse_server_sent_event(message).is_err());
+    }
+
+    #[test]
+    fn test_matches_word_boundary() {
+        // Test single word matches
+        assert!(matches_word_boundary("hello world", "hello"));
+        assert!(matches_word_boundary("hello world", "world"));
+        
+        // Test case insensitivity
+        assert!(matches_word_boundary("Hello World", "hello"));
+        assert!(matches_word_boundary("HELLO WORLD", "world"));
+        
+        // Test word boundaries
+        assert!(!matches_word_boundary("helloworld", "hello"));
+        assert!(!matches_word_boundary("worldly", "world"));
+        
+        // Test multi-word matches
+        assert!(matches_word_boundary("hello beautiful world", "hello world"));
+        assert!(!matches_word_boundary("helloworld", "hello world"));
+        
+        // Test with punctuation
+        assert!(matches_word_boundary("hello, world!", "hello"));
+        assert!(matches_word_boundary("hello, world!", "world"));
+        
+        // Test with special characters
+        assert!(matches_word_boundary("hello-world", "hello"));
+        assert!(matches_word_boundary("hello_world", "world"));
+    }
+
+    #[test]
+    fn test_rate_limit_info() {
+        let mut rate_limit = RateLimitInfo::new(3);
+        
+        // Should allow first 3 requests
+        assert!(rate_limit.can_process());
+        assert!(rate_limit.can_process());
+        assert!(rate_limit.can_process());
+        
+        // Should deny 4th request
+        assert!(!rate_limit.can_process());
+        
+        // Test expiration of old requests
+        let mut rate_limit = RateLimitInfo::new(2);
+        assert!(rate_limit.can_process());
+        assert!(rate_limit.can_process());
+        assert!(!rate_limit.can_process());
+        
+        // Manually modify timestamps to simulate time passing
+        rate_limit.matches[0] = Instant::now() - Duration::from_secs(61);
+        
+        // Should allow another request after one expired
+        assert!(rate_limit.can_process());
+        assert!(!rate_limit.can_process());
+    }
 }
