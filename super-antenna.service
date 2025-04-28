@@ -1,0 +1,44 @@
+[Unit]
+Description=Super Antenna - Sharkey Provider
+Documentation=https://github.com/PrivateGER/super-antenna
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=super-antenna
+Group=super-antenna
+ExecStart=/usr/local/bin/super-antenna
+Restart=on-failure
+RestartSec=30s
+
+# Optional Security hardening
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+RestrictRealtime=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+# Environment variables
+Environment=BASE_URL=https://your-instance.com
+Environment=STREAMING_URL=https://fedi.buzz/api/v1/streaming/public
+Environment=API_TOKEN=your-api-token
+# Optionally set log level
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target 
