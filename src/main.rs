@@ -162,6 +162,12 @@ async fn connect_to_stream(
     let mut retry_count = 0;
     let max_retries = 5;
     
+    // Get optional streaming token from environment
+    let streaming_token = std::env::var("STREAMING_TOKEN").ok();
+    if let Some(token) = &streaming_token {
+        info!("Using authentication for streaming API");
+    }
+    
     loop {
         info!("Connecting to streaming API at {}", streaming_url);
         
@@ -170,12 +176,17 @@ async fn connect_to_stream(
             .tcp_keepalive(Some(Duration::from_secs(10)))
             .build()?;
             
-        match streaming_client.get(streaming_url)
+        // Build request with optional authentication
+        let mut request = streaming_client.get(streaming_url)
             .header("Accept", "text/event-stream")
-            .header("Connection", "keep-alive")
-            .send()
-            .await {
-                
+            .header("Connection", "keep-alive");
+            
+        // Add authorization header if streaming token is provided
+        if let Some(token) = &streaming_token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+        
+        match request.send().await {
             Ok(response) => {
                 if !response.status().is_success() {
                     error!("Failed to connect: HTTP {}", response.status());
@@ -296,6 +307,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let base_url = std::env::var("BASE_URL").expect("BASE_URL must be set");
     let streaming_url = std::env::var("STREAMING_URL").expect("STREAMING_URL must be set");
     let api_token = std::env::var("API_TOKEN").expect("API_TOKEN must be set");
+    
+    // Check if streaming token is set
+    if std::env::var("STREAMING_TOKEN").is_ok() {
+        info!("Authentication for streaming API is enabled");
+    } else {
+        info!("Authentication for streaming API is disabled");
+    }
     
     // Get metrics port from environment or use default
     let metrics_port = match std::env::var("METRICS_PORT") {
